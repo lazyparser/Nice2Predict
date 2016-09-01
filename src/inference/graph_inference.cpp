@@ -17,8 +17,12 @@
 #include "graph_inference.h"
 
 #include <stdio.h>
+#include <math.h>
 #include <queue>
 #include <unordered_set>
+#include <algorithm>
+#include <random>
+#include <iterator>
 
 #include "stringprintf.h"
 #include "glog/logging.h"
@@ -35,13 +39,22 @@ DEFINE_bool(initial_greedy_assignment_pass, true, "Whether to run an initial gre
 DEFINE_bool(duplicate_name_resolution, true, "Whether to attempt a duplicate name resultion on conflicts.");
 DEFINE_int32(graph_per_node_passes, 8, "Number of per-node passes for inference");
 DEFINE_int32(graph_per_arc_passes, 5, "Number of per-arc passes for inference");
+DEFINE_int32(graph_per_factor_passes, 1, "Number of per-factor passes for inference");
 DEFINE_int32(graph_loopy_bp_passes, 0, "Number of loopy belief propagation passes for inference");
 DEFINE_int32(graph_loopy_bp_steps_per_pass, 3, "Number of loopy belief propagation steps in each inference pass");
 DEFINE_int32(skip_per_arc_optimization_for_nodes_above_degree, 32,
     "Skip the per-arc optimization pass if an edge is connected to a node with the in+out degree more than the given value");
 
+DEFINE_bool(use_factors, true, "Flag that enable the use of the factors in training and MAP inference.");
+DEFINE_int32(maximum_depth, 2, "Maximum depth of the multi-level map used to store the factor features");
+DEFINE_int32(factors_limit, 128, "Maximum number of factor candidates considered for inference using factor features");
+DEFINE_uint64(permutations_beam_size, 64, "Maximum number of permutations of the assignments to unknown labels in a factor");
 
 DEFINE_string(valid_labels, "valid_names.txt", "A file describing valid names");
+DEFINE_string(unknown_label,
+    "", "A special label that denotes that a label is of low frequency (and thus unknown).");
+DEFINE_int32(min_freq_known_label, 0,
+    "Minimum number of graphs a label must appear it in order to not be declared unknown");
 
 static const size_t kInitialAssignmentBeamSize = 4;
 
@@ -51,6 +64,8 @@ static const size_t kMaxPerArcBeamSize = 64;
 static const size_t kStartPerNodeBeamSize = 4;
 static const size_t kMaxPerNodeBeamSize = 64;
 static const size_t kLoopyBPBeamSize = 32;
+
+static const size_t kFactorsLimitBeforeGoingDepperMultiLevelMap = 16;
 
 namespace std {
   template <> struct hash<Json::Value> {
@@ -71,6 +86,31 @@ namespace std {
       return 0;
     }
   };
+}
+
+// Returns -1 if the result will overflow.
+uint64 CalculateFactorial(int n) {
+  uint64 result = 1;
+  for (size_t i = n; i > 0; i--) {
+    // Check if result will overflow.
+    if (result > (UINT64_MAX / i)) {
+      return -1;
+    }
+    result *= i;
+  }
+  return result;
+}
+
+// http://stackoverflow.com/a/6867612
+// https://github.com/aappleby/smhasher/blob/master/src/MurmurHash3.cpp
+uint64 HashInt(uint64 x) {
+  x++;
+  x ^= x >> 33;
+  x *= 0xff51afd7ed558ccd;
+  x ^= x >> 33;
+  x *= 0xc4ceb9fe1a85ec53;
+  x ^= x >> 33;
+  return x;
 }
 
 class JsonValueNumberer {
@@ -113,13 +153,14 @@ class GraphQuery : public Nice2Query {
 public:
   explicit GraphQuery(const StringSet* ss, const LabelChecker* checker) : label_set_(ss, checker) {
     arcs_connecting_node_pair_.set_empty_key(IntPair(-1, -1));
-    arcs_connecting_node_pair_.set_deleted_key(IntPair(-1, -1));
+    arcs_connecting_node_pair_.set_deleted_key(IntPair(-2, -2));
   }
   virtual ~GraphQuery() {
   }
 
   virtual void FromJSON(const Json::Value& query) override {
     arcs_.clear();
+    factors_.clear();
 
     CHECK(query.isArray());
     for (const Json::Value& arc : query) {
@@ -146,9 +187,20 @@ public:
           nodes_in_scope_.push_back(std::move(scope_vars));
         }
       }
+      if (FLAGS_use_factors) {
+        if (arc.isMember("group")) {
+          const Json::Value& v = arc["group"];
+          if (v.isArray()) {
+            Factor factor_vars;
+            for (const Json::Value& item : v) {
+              factor_vars.insert(numberer_.ValueToNumber(item));
+            }
+            factors_.push_back(factor_vars);
+          }
+        }
+      }
     }
     std::sort(arcs_.begin(), arcs_.end());
-
     arcs_adjacent_to_node_.assign(numberer_.size(), std::vector<Arc>());
     for (const Arc& a : arcs_) {
       arcs_adjacent_to_node_[a.node_a].push_back(a);
@@ -171,6 +223,13 @@ public:
         scopes_per_nodes_[node].push_back(scope);
       }
     }
+
+    factors_of_a_node_.assign(numberer_.size(), std::vector<int>());
+    for (size_t i = 0; i < factors_.size(); ++i) {
+      for (auto var = factors_[i].begin(); var != factors_[i].end(); ++var) {
+        factors_of_a_node_[*var].push_back(i);
+      }
+    }
   }
 
 private:
@@ -187,7 +246,9 @@ private:
   };
 
   std::vector<std::vector<Arc> > arcs_adjacent_to_node_;
+  std::vector<std::vector<int> > factors_of_a_node_;
   std::vector<Arc> arcs_;
+  std::vector<Factor> factors_;
   google::dense_hash_map<IntPair, std::vector<Arc> > arcs_connecting_node_pair_;
   JsonValueNumberer numberer_;
 
@@ -229,7 +290,8 @@ struct GraphInferenceStats {
 
 class GraphNodeAssignment : public Nice2Assignment {
 public:
-  GraphNodeAssignment(const GraphQuery* query, LabelSet* label_set) : query_(query), label_set_(label_set) {
+  GraphNodeAssignment(const GraphQuery* query, LabelSet* label_set, int unknown_label)
+    : query_(query), label_set_(label_set), unknown_label_(unknown_label) {
     assignments_.assign(query_->numberer_.size(), Assignment());
     penalties_.assign(assignments_.size(), LabelPenalty());
   }
@@ -268,6 +330,7 @@ public:
         assignments_[number] = aset;
       }
     }
+
     ClearPenalty();
   }
 
@@ -300,9 +363,14 @@ public:
     const GraphNodeAssignment* ref = static_cast<const GraphNodeAssignment*>(reference);
     int correct_labels = 0;
     int incorrect_labels = 0;
+    int num_known_predictions = 0;
     for (size_t i = 0; i < assignments_.size(); ++i) {
       if (assignments_[i].must_infer) {
-        if (assignments_[i].label == ref->assignments_[i].label) {
+        if (assignments_[i].label != unknown_label_) {
+          ++num_known_predictions;
+        }
+        if (assignments_[i].label == ref->assignments_[i].label &&
+            assignments_[i].label != unknown_label_) {
           ++correct_labels;
         } else {
           ++incorrect_labels;
@@ -312,6 +380,7 @@ public:
     std::lock_guard<std::mutex> guard(stats->lock);
     stats->correct_labels += correct_labels;
     stats->incorrect_labels += incorrect_labels;
+    stats->num_known_predictions += num_known_predictions;
   }
 
   virtual void CompareAssignmentErrors(const Nice2Assignment* reference, SingleLabelErrorStats* error_stats) const override {
@@ -345,11 +414,11 @@ public:
   double GetNodePenalty(int node) const {
     return (assignments_[node].label == penalties_[node].label) ? penalties_[node].penalty : 0.0;
   }
-
   // Gets the score contributed by all arcs adjacent to a node.
   double GetNodeScore(const GraphInference& fweights, int node) const {
     double sum = -GetNodePenalty(node);
     const GraphInference::FeaturesMap& features = fweights.features_;
+    const GraphInference::Uint64FactorFeaturesMap& factor_features = fweights.factor_features_;
     for (const GraphQuery::Arc& arc : query_->arcs_adjacent_to_node_[node]) {
       GraphFeature feature(
           assignments_[arc.node_a].label,
@@ -360,6 +429,72 @@ public:
         sum += feature_it->second.getValue();
       }
     }
+
+    const std::vector<int>& factors_of_a_node = query_->factors_of_a_node_[node];
+    for (size_t i = 0; i < factors_of_a_node.size(); ++i) {
+      uint64 hash = 0;
+      const Factor& factor = query_->factors_[factors_of_a_node[i]];
+      for (auto var_it = factor.begin();
+                var_it != factor.end(); ++var_it) {
+        hash += HashInt(assignments_[*var_it].label);
+      }
+
+      auto factor_feature = factor_features.find(hash);
+      if (factor_feature != factor_features.end()) {
+        sum += factor_feature->second;
+      }
+    }
+    return sum;
+  }
+
+  // Gets the node score given an assignment
+  double GetNodeScoreGivenAssignmentToANode(const GraphInference& fweights, int node, int node_assigned, int node_assignment) const {
+    double sum = -GetNodePenalty(node);
+    const GraphInference::FeaturesMap& features = fweights.features_;
+    const GraphInference::Uint64FactorFeaturesMap& factor_features = fweights.factor_features_;
+    for (const GraphQuery::Arc& arc : query_->arcs_adjacent_to_node_[node]) {
+      int node_a_label;
+      int node_b_label;
+      if (arc.node_a == node_assigned) {
+        node_a_label = node_assignment;
+      } else {
+        node_a_label = assignments_[arc.node_a].label;
+      }
+      if (arc.node_b == node_assigned) {
+        node_b_label = node_assignment;
+      } else {
+        node_b_label = assignments_[arc.node_b].label;
+      }
+      GraphFeature feature(
+          node_a_label,
+          node_b_label,
+          arc.type);
+      auto feature_it = features.find(feature);
+      if (feature_it != features.end()) {
+        sum += feature_it->second.getValue();
+      }
+    }
+
+    int node_label = assignments_[node].label;
+    if (node == node_assigned) {
+      node_label = node_assignment;
+    }
+    const std::vector<int>& factors_of_a_node = query_->factors_of_a_node_[node];
+    for (size_t i = 0; i < factors_of_a_node.size(); ++i) {
+      uint64 hash = HashInt(node_label);
+      const Factor& factor = query_->factors_[factors_of_a_node[i]];
+      for (auto var = factor.begin();
+                var != factor.end(); ++var) {
+        if (*var != node) {
+          hash += HashInt(assignments_[*var].label);
+        }
+      }
+      auto factor_feature = factor_features.find(hash);
+      if (factor_feature != factor_features.end()) {
+        sum += factor_feature->second;
+      }
+    }
+
     return sum;
   }
 
@@ -385,6 +520,7 @@ public:
 
   bool HasDuplicationConflictsAtNode(int node) const {
     int node_label = assignments_[node].label;
+    if (node_label == unknown_label_) return false;
     const std::vector<int>& scopes = query_->scopes_per_nodes_[node];
     for (int scope : scopes) {
       const std::vector<int>& nodes_per_scope = query_->nodes_in_scope_[scope];
@@ -416,24 +552,6 @@ public:
     return conflict_node;
   }
 
-  // Gets the score contributed by all arcs adjacent to a node not connecting to a given node.
-  double GetNodeScoreNotConnecting(const GraphInference& fweights, int node, int not_connecting) const {
-    double sum = -GetNodePenalty(node);
-    const GraphInference::FeaturesMap& features = fweights.features_;
-    for (const GraphQuery::Arc& arc : query_->arcs_adjacent_to_node_[node]) {
-      if (arc.node_a == not_connecting || arc.node_b == not_connecting) continue;
-      GraphFeature feature(
-          assignments_[arc.node_a].label,
-          assignments_[arc.node_b].label,
-          arc.type);
-      auto feature_it = features.find(feature);
-      if (feature_it != features.end()) {
-        sum += feature_it->second.getValue();
-      }
-    }
-    return sum;
-  }
-
   // Gets the score connecting a pair of nodes.
   double GetNodePairScore(const GraphInference& fweights, int node1, int node2, int label1, int label2) const {
     double sum = 0;
@@ -454,26 +572,16 @@ public:
     return query_->arcs_adjacent_to_node_[node].size();
   }
 
-  // Gets the score contributed by all arcs adjacent to a node.
-  double GetNodeScoreOnlyToGivenAssignments(const GraphInference& fweights, int node) const {
-    double sum = 0;
-    const GraphInference::FeaturesMap& features = fweights.features_;
-    for (const GraphQuery::Arc& arc : query_->arcs_adjacent_to_node_[node]) {
-      if (arc.node_a != arc.node_b &&
-          assignments_[arc.node_a].must_infer &&
-          assignments_[arc.node_b].must_infer) continue;
-      GraphFeature feature(
-          assignments_[arc.node_a].label,
-          assignments_[arc.node_b].label,
-          arc.type);
-      auto feature_it = features.find(feature);
-      if (feature_it != features.end()) {
-        sum += feature_it->second.getValue();
-      }
-    }
-    return sum;
+  void GetFactorCandidates(const GraphInference& fweights,
+      const int factor_size,
+      std::vector<Factor>* candidates,
+      const Factor& giv_labels,
+      const size_t beam_size) {
+    FactorFeaturesLevel empty_level;
+    const FactorFeaturesLevel& v = FindWithDefault(fweights.best_factor_features_first_level_, factor_size, empty_level);
+    auto it = giv_labels.begin();
+    v.GetFactors(giv_labels, *it, candidates, beam_size);
   }
-
 
   void GetLabelCandidates(const GraphInference& fweights, int node,
       std::vector<int>* candidates, size_t beam_size) const {
@@ -496,11 +604,20 @@ public:
         }
       }
     }
+
 #ifdef GRAPH_INFERENCE_STATS
     stats_.label_candidates_per_node.AddCount(candidates->size(), 1);
 #endif
     std::sort(candidates->begin(), candidates->end());
     candidates->erase(std::unique(candidates->begin(), candidates->end()), candidates->end());
+  }
+
+  void ReplaceLabelsWithUnknown(const GraphInference& fweights) {
+    for (size_t i = 0; i < assignments_.size(); ++i) {
+      if (fweights.label_frequency_.find(assignments_[i].label) == fweights.label_frequency_.end()) {
+        assignments_[i].label = unknown_label_;
+      }
+    }
   }
 
   double GetTotalScore(const GraphInference& fweights) const {
@@ -534,6 +651,61 @@ public:
           assignments_[arc.node_b].label,
           arc.type);
       (*affected_features)[feature] += gradient_weight;
+    }
+  }
+
+  void GetAffectedFactorFeatures(
+      GraphInference::Uint64FactorFeaturesMap* affected_factor_features,
+      double gradient_weight) const {
+    for (const Factor& factor : query_->factors_) {
+      uint64 hash = 0;
+      for (auto var = factor.begin(); var != factor.end(); ++var) {
+        hash += HashInt(assignments_[*var].label);
+      }
+      (*affected_factor_features)[hash] += gradient_weight;
+    }
+  }
+
+  // Method that given a certain node and a label, first assign that label to the given node and then add the gradient_weight
+  // to every affected feature related to the given node and its neighbours
+  void GetNeighboringAffectedFeatures(
+      GraphInference::SimpleFeaturesMap* affected_features,
+      int node,
+      int label,
+      double gradient_weight) const {
+    for (const auto & arc : query_->arcs_adjacent_to_node_[node]) {
+      int label_node_a = assignments_[arc.node_a].label;
+      int label_node_b = assignments_[arc.node_b].label;
+      if (arc.node_a == node) {
+        label_node_a = label;
+      }
+      if (arc.node_b == node) {
+        label_node_b = label;
+      }
+      GraphFeature feature(
+          label_node_a,
+          label_node_b,
+          arc.type);
+      (*affected_features)[feature] += gradient_weight;
+    }
+  }
+
+  void GetFactorAffectedFeaturesOfNode(
+      GraphInference::Uint64FactorFeaturesMap* factor_affected_features,
+      int node,
+      int label,
+      double gradient_weight) const {
+    int node_label = label;
+    const std::vector<int>& factors_of_a_node = query_->factors_of_a_node_[node];
+    for (size_t i = 0; i < factors_of_a_node.size(); ++i) {
+      uint64 hash = HashInt(node_label);
+      const Factor& f = query_->factors_[factors_of_a_node[i]];
+      for (auto var = f.begin(); var != f.end(); ++var) {
+        if (*var != node) {
+          hash += HashInt(assignments_[(*var)].label);
+        }
+      }
+      (*factor_affected_features)[hash] += gradient_weight;
     }
   }
 
@@ -713,6 +885,124 @@ public:
     }
   }
 
+  // Perform optimization based on factor features
+  void LocalPerFactorOptimizationPass(const GraphInference& fweights, size_t beam_size) {
+    std::vector<std::pair<double, Factor>> empty;
+    for (const Factor& factor : query_->factors_) {
+      std::vector<int> inf_nodes;
+      inf_nodes.reserve(factor.size());
+      Factor giv_labels;
+      // Separates between given and to be inferred.
+      for (auto var = factor.begin(); var != factor.end(); ++var) {
+        Assignment a = assignments_[(*var)];
+        if (a.must_infer == true) {
+          inf_nodes.push_back((*var));
+        } else {
+          giv_labels.insert(a.label);
+        }
+      }
+
+      std::vector<Factor> factors;
+      GetFactorCandidates(fweights, factor.size(), &factors, giv_labels, beam_size);
+      double best_score = 0;
+      std::vector<int> best_assignments(inf_nodes.size());
+      // Initialize the best score and best assignments with the current assignments on the to be inferred nodes
+      // of the factor.
+      for (size_t j = 0; j < inf_nodes.size(); ++j) {
+        best_score += GetNodeScore(fweights, inf_nodes[j]);
+        best_assignments[j] = assignments_[inf_nodes[j]].label;
+      }
+      std::vector<Factor> factors_candidates;
+      // Determines which of the factors match the given labels.
+      for (size_t j = 0; j < factors.size(); ++j) {
+        bool factor_matches_giv_vars = true;
+        for (auto label = giv_labels.begin(); label != giv_labels.end(); ++label) {
+          // Each given label contained in giv_labels needs to be present in the factor candidate at least the same number of times that it is contained
+          // in the given labels set.
+          if (factors[j].count(*label) < giv_labels.count(*label)) {
+            factor_matches_giv_vars = false;
+            break;
+          }
+        }
+        if (factor_matches_giv_vars) {
+          factors_candidates.push_back(factors[j]);
+        }
+      }
+
+      // Go over all factors containing the labels in the "given" set, and create
+      // the initial permutation. It includes all labels in a factor that are not in the "given" set.
+      for (size_t j = 0; j < factors_candidates.size(); ++j) {
+        Factor giv_labels_copy = giv_labels;
+        std::vector<int> candidate_inf_labels;
+        candidate_inf_labels.reserve(factors_candidates[j].size());
+        for (auto label = factors_candidates[j].begin(); label != factors_candidates[j].end(); ++label) {
+          // Check if the label belongs to the "given" set.
+          const auto& it = giv_labels_copy.find(*label);
+          if (it != giv_labels_copy.end()) {
+            giv_labels_copy.erase(it);
+          } else {
+            candidate_inf_labels.push_back(*label);
+          }
+        }
+
+        bool is_assignment_label_valid = true;
+        for (size_t z = 0; z < candidate_inf_labels.size(); ++z) {
+          if (!fweights.label_checker_.IsLabelValid(candidate_inf_labels[z])) {
+            is_assignment_label_valid = false;
+          }
+        }
+        if (!is_assignment_label_valid) {
+          continue;
+        }
+        uint64 num_permutations = CalculateFactorial(candidate_inf_labels.size());
+        // If the factorial will go in overflow it will return -1.
+        size_t current_num_permutations = 0;
+        if (num_permutations < 0 || num_permutations > FLAGS_permutations_beam_size) {
+          while (current_num_permutations < FLAGS_permutations_beam_size) {
+            PerformPermutationOptimization(inf_nodes, fweights, candidate_inf_labels, &best_assignments, &best_score);
+            std::random_shuffle(candidate_inf_labels.begin(), candidate_inf_labels.end());
+            current_num_permutations++;
+          }
+        } else {
+          std::sort(candidate_inf_labels.begin(), candidate_inf_labels.end());
+          do {
+            PerformPermutationOptimization(inf_nodes, fweights, candidate_inf_labels, &best_assignments, &best_score);
+            current_num_permutations++;
+          } while(std::next_permutation(candidate_inf_labels.begin(), candidate_inf_labels.end()) &&
+                  current_num_permutations < FLAGS_permutations_beam_size);
+        }
+      }
+      for (size_t j = 0; j < inf_nodes.size(); ++j) {
+        assignments_[inf_nodes[j]].label = best_assignments[j];
+      }
+    }
+  }
+
+  void PerformPermutationOptimization(const std::vector<int>& inf_nodes,
+                                      const GraphInference& fweights,
+                                      const std::vector<int>& candidate_inf_labels,
+                                      std::vector<int>* best_assignments,
+                                      double* best_score) {
+    for (size_t z = 0; z < inf_nodes.size(); ++z) {
+      assignments_[inf_nodes[z]].label = candidate_inf_labels[z];
+    }
+    for (size_t z = 0; z < inf_nodes.size(); ++z) {
+      if (HasDuplicationConflictsAtNode(inf_nodes[z])) {
+        return;
+      }
+    }
+    double score = 0;
+    for (size_t z = 0; z < inf_nodes.size(); ++z) {
+      score += GetNodeScore(fweights, inf_nodes[z]);
+    }
+    if (score > *best_score) {
+      for (size_t z = 0; z < inf_nodes.size(); ++z) {
+        (*best_assignments)[z] = assignments_[inf_nodes[z]].label;
+      }
+      *best_score = score;
+    }
+  }
+
 private:
   struct Assignment {
     Assignment() : must_infer(false), label(-1) {}
@@ -732,6 +1022,7 @@ private:
 
   const GraphQuery* query_;
   LabelSet* label_set_;
+  int unknown_label_;
 
 #ifdef GRAPH_INFERENCE_STATS
   mutable GraphInferenceStats stats_;
@@ -922,12 +1213,16 @@ private:
 
 
 
-GraphInference::GraphInference() : svm_regularizer_(1.0), svm_margin_(1e-9), num_svm_training_samples_(0) {
+GraphInference::GraphInference() : unknown_label_(-1), regularizer_(1.0), svm_margin_(1e-9), beam_size_(0), num_svm_training_samples_(0) {
   // Initialize dense_hash_map.
   features_.set_empty_key(GraphFeature(-1, -1, -1));
   features_.set_deleted_key(GraphFeature(-2, -2, -2));
   best_features_for_type_.set_empty_key(-1);
   best_features_for_type_.set_deleted_key(-2);
+  best_factor_features_first_level_.set_empty_key(-1);
+  best_factor_features_first_level_.set_deleted_key(-2);
+  label_frequency_.set_empty_key(-1);
+  label_frequency_.set_deleted_key(-2);
 }
 
 GraphInference::~GraphInference() {
@@ -939,6 +1234,7 @@ void GraphInference::LoadModel(const std::string& file_prefix) {
 
   FILE* ffile = fopen(StringPrintf("%s_features", file_prefix.c_str()).c_str(), "rb");
   int num_features = 0;
+  int num_factor_features = 0;
   CHECK_EQ(1, fread(&num_features, sizeof(int), 1, ffile));
   for (int i = 0; i < num_features; ++i) {
     GraphFeature f(0, 0, 0);
@@ -947,12 +1243,46 @@ void GraphInference::LoadModel(const std::string& file_prefix) {
     CHECK_EQ(1, fread(&score, sizeof(double), 1, ffile));
     features_[f].setValue(score);
   }
+
+  int ret = fread(&num_factor_features, sizeof(int), 1, ffile);
+  if (ret == 1) {
+    for (int i = 0; i < num_factor_features; ++i) {
+      Factor f;
+      int size_of_factor = 0;
+      CHECK_EQ(1, fread(&size_of_factor, sizeof(int), 1, ffile));
+      uint64 hash = 0;
+      for (int j = 0; j < size_of_factor; ++j) {
+        int f_var = -1;
+        CHECK_EQ(1, fread(&f_var, sizeof(int), 1, ffile));
+        f.insert(f_var);
+        hash += HashInt(f_var);
+      }
+      double score;
+      CHECK_EQ(1, fread(&score, sizeof(double), 1, ffile));
+      factor_features_[hash] = score;
+    }
+  }
   fclose(ffile);
   CHECK_EQ(features_.size(), num_features);
 
   FILE* sfile = fopen(StringPrintf("%s_strings", file_prefix.c_str()).c_str(), "rb");
   strings_.loadFromFile(sfile);
   fclose(sfile);
+
+  if (!FLAGS_unknown_label.empty()) {
+    int a, b, size;
+    label_frequency_.clear();
+    FILE* lffile = fopen(StringPrintf("%s_lfreq", file_prefix.c_str()).c_str(), "rb");
+    CHECK_EQ(1, fread(&size, sizeof(int), 1, lffile));
+    for (int i = 0; i < size; ++i) {
+      CHECK_EQ(1, fread(&a, sizeof(int), 1, lffile));
+      CHECK_EQ(1, fread(&b, sizeof(int), 1, lffile));
+      label_frequency_[a] = b;
+    }
+    CHECK_EQ(static_cast<int>(label_frequency_.size()), size);
+    fclose(lffile);
+  }
+
   LOG(INFO) << "Loading model done";
 
   PrepareForInference();
@@ -962,10 +1292,25 @@ void GraphInference::SaveModel(const std::string& file_prefix) {
   LOG(INFO) << "Saving model " << file_prefix << "...";
   FILE* ffile = fopen(StringPrintf("%s_features", file_prefix.c_str()).c_str(), "wb");
   int num_features = features_.size();
+  int num_factor_features = factors_set_.size();
   fwrite(&num_features, sizeof(int), 1, ffile);
   for (auto it = features_.begin(); it != features_.end(); ++it) {
     fwrite(&it->first, sizeof(GraphFeature), 1, ffile);
     double value = it->second.getValue();
+    fwrite(&value, sizeof(double), 1, ffile);
+  }
+
+  fwrite(&num_factor_features, sizeof(int), 1, ffile);
+  for (auto f = factors_set_.begin(); f != factors_set_.end(); ++f) {
+    int size_of_factor = f->size();
+    uint64 hash = 0;
+    fwrite(&size_of_factor, sizeof(int), 1, ffile);
+    for (auto var = f->begin(); var != f->end(); ++var) {
+      int var_val = *var;
+      hash += HashInt(var_val);
+      fwrite(&var_val, sizeof(int), 1, ffile);
+    }
+    double value = factor_features_[hash];
     fwrite(&value, sizeof(double), 1, ffile);
   }
   fclose(ffile);
@@ -973,6 +1318,21 @@ void GraphInference::SaveModel(const std::string& file_prefix) {
   FILE* sfile = fopen(StringPrintf("%s_strings", file_prefix.c_str()).c_str(), "wb");
   strings_.saveToFile(sfile);
   fclose(sfile);
+
+  if (!FLAGS_unknown_label.empty()) {
+    int x;
+    FILE* lffile = fopen(StringPrintf("%s_lfreq", file_prefix.c_str()).c_str(), "wb");
+    x = label_frequency_.size();
+    fwrite(&x, sizeof(int), 1, lffile);
+    for (auto it = label_frequency_.begin(); it != label_frequency_.end(); ++it) {
+      x = it->first;
+      fwrite(&x, sizeof(int), 1, lffile);
+      x = it->second;
+      fwrite(&x, sizeof(int), 1, lffile);
+    }
+    fclose(lffile);
+  }
+
   LOG(INFO) << "Saving model done";
 }
 
@@ -981,9 +1341,12 @@ Nice2Query* GraphInference::CreateQuery() const {
 }
 Nice2Assignment* GraphInference::CreateAssignment(Nice2Query* query) const {
   GraphQuery* q = static_cast<GraphQuery*>(query);
-  return new GraphNodeAssignment(q, &q->label_set_);
+  return new GraphNodeAssignment(q, &q->label_set_, unknown_label_);
 }
 void GraphInference::PerformAssignmentOptimization(GraphNodeAssignment* a) const {
+  if (unknown_label_ >= 0) {
+    a->ReplaceLabelsWithUnknown(*this);
+  }
   double score = a->GetTotalScore(*this);
   VLOG(1) << "Start score " << score;
   if (FLAGS_initial_greedy_assignment_pass) {
@@ -1025,6 +1388,12 @@ void GraphInference::PerformAssignmentOptimization(GraphNodeAssignment* a) const
 
       per_arc_beam_size = std::min(per_arc_beam_size * 2, kMaxPerArcBeamSize);
     }
+    if (pass < FLAGS_graph_per_factor_passes) {
+      int64 start_time = GetCurrentTimeMicros();
+      a->LocalPerFactorOptimizationPass(*this, FLAGS_factors_limit);
+      int64 end_time = GetCurrentTimeMicros();
+      VLOG(2) << "Per factor pass " << (end_time - start_time)/1000 << "ms.";
+    }
 
     double updated_score = a->GetTotalScore(*this);
     VLOG(2) << "Got to score " << updated_score;
@@ -1049,12 +1418,57 @@ double GraphInference::GetAssignmentScore(const Nice2Assignment* assignment) con
   return a->GetTotalScore(*this);
 }
 
-void GraphInference::SSVMInit(double regularization, double margin) {
-  svm_regularizer_ = 1 / regularization;
-  for (auto it = features_.begin(); it != features_.end(); ++it) {
-    it->second.setValue(svm_regularizer_ * 0.5);
+void GraphInference::UpdateStats(
+    const GraphNodeAssignment& assignment,
+    const GraphNodeAssignment& new_assignment,
+    PrecisionStats *stats,
+    const double margin) {
+
+  int correct_labels = 0, incorrect_labels = 0, num_known_predictions = 0;
+  for (size_t i = 0; i < new_assignment.assignments_.size(); ++i) {
+    if (new_assignment.assignments_[i].must_infer) {
+      if (new_assignment.assignments_[i].label != unknown_label_) {
+        ++num_known_predictions;
+      }
+      if (new_assignment.assignments_[i].label == assignment.assignments_[i].label &&
+          new_assignment.assignments_[i].label != unknown_label_) {
+        ++correct_labels;
+      } else {
+        ++incorrect_labels;
+      }
+    }
   }
+  {  // Atomic update stats.
+    std::lock_guard<std::mutex> guard(stats->lock);
+    stats->correct_labels += correct_labels;
+    stats->incorrect_labels += incorrect_labels;
+    stats->num_known_predictions += num_known_predictions;
+    ++num_svm_training_samples_;
+    if (num_svm_training_samples_ % 10000 == 0) {
+      double error_rate = stats->incorrect_labels / (static_cast<double>(stats->incorrect_labels + stats->correct_labels));
+      double recall = stats->num_known_predictions / (static_cast<double>(stats->incorrect_labels + stats->correct_labels));
+      LOG(INFO) << "At training sample " << num_svm_training_samples_ << ": error rate of " << std::fixed << error_rate
+          << " . Recall " << std::fixed << recall;
+    }
+  }
+}
+
+void GraphInference::InitializeFeatureWeights(double regularization) {
+  regularizer_ = 1 / regularization;
+  for (auto it = features_.begin(); it != features_.end(); ++it) {
+    it->second.setValue(regularizer_ * 0.5);
+  }
+  for (auto it = factor_features_.begin(); it != factor_features_.end(); ++it) {
+    it->second = regularizer_ * 0.5;
+  }
+}
+
+void GraphInference::SSVMInit(double margin) {
   svm_margin_ = margin;
+}
+
+void GraphInference::PLInit(int beam_size) {
+  beam_size_ = beam_size;
 }
 
 void GraphInference::SSVMLearn(
@@ -1068,40 +1482,93 @@ void GraphInference::SSVMLearn(
   new_assignment.SetUpEqualityPenalty(svm_margin_);
   PerformAssignmentOptimization(&new_assignment);
 
-  int correct_labels = 0, incorrect_labels = 0;
-  for (size_t i = 0; i < new_assignment.assignments_.size(); ++i) {
-    if (new_assignment.assignments_[i].must_infer) {
-      if (new_assignment.assignments_[i].label == a->assignments_[i].label) {
-        ++correct_labels;
-      } else {
-        ++incorrect_labels;
-      }
-    }
-  }
-  {  // Atomic update stats.
-    std::lock_guard<std::mutex> guard(stats->lock);
-    stats->correct_labels += correct_labels;
-    stats->incorrect_labels += incorrect_labels;
-    ++num_svm_training_samples_;
-    if (num_svm_training_samples_ % 10000 == 0) {
-      double error_rate = stats->incorrect_labels / (static_cast<double>(stats->incorrect_labels + stats->correct_labels));
-      LOG(INFO) << "At training sample " << num_svm_training_samples_ << ": error rate of " << std::fixed << error_rate;
-    }
-  }
+  UpdateStats((*a), new_assignment, stats, svm_margin_);
 
   // Perform gradient descent.
   SimpleFeaturesMap affected_features;  // Gradient for each affected feature.
+  Uint64FactorFeaturesMap factor_affected_features;
   affected_features.set_empty_key(GraphFeature(-1, -1, -1));
   affected_features.set_deleted_key(GraphFeature(-2, -2, -2));
   a->GetAffectedFeatures(&affected_features, learning_rate);
+  a->GetAffectedFactorFeatures(&factor_affected_features, learning_rate);
   new_assignment.GetAffectedFeatures(&affected_features, -learning_rate);
-
+  new_assignment.GetAffectedFactorFeatures(&factor_affected_features, -learning_rate);
   for (auto it = affected_features.begin(); it != affected_features.end(); ++it) {
     if (it->second < -1e-9 || it->second > 1e-9) {
       VLOG(3) << a->GetLabelName(it->first.a_) << " " << a->GetLabelName(it->first.b_) << " " << a->GetLabelName(it->first.type_) << " " << it->second;
       auto features_it = features_.find(it->first);
       if (features_it != features_.end()) {
-        features_it->second.atomicAddRegularized(it->second, 0, svm_regularizer_);
+        features_it->second.atomicAddRegularized(it->second, 0, regularizer_);
+      }
+    }
+  }
+
+  for (auto f_feature = factor_affected_features.begin(); f_feature != factor_affected_features.end(); ++f_feature) {
+    if (f_feature->second < -1e-9 || f_feature->second > 1e-9) {
+
+      auto factor_feature = factor_features_.find(f_feature->first);
+      if (factor_feature != factor_features_.end()) {
+        factor_feature->second += f_feature->second;
+        // L_inf regularize the new value.
+        if (factor_feature->second < 0) factor_feature->second = 0;
+        if (factor_feature->second > regularizer_) factor_feature->second = regularizer_;
+      }
+    }
+  }
+}
+
+void GraphInference::PLLearn(
+    const Nice2Query* query,
+    const Nice2Assignment* assignment,
+    double learning_rate) {
+  CHECK_GT(beam_size_, 0) << "PLInit not called or beam size was set to an invalid value.";
+  const GraphNodeAssignment* a = static_cast<const GraphNodeAssignment*>(assignment);
+
+  // Perform gradient descent
+  SimpleFeaturesMap affected_features;  // Gradient for each affected feature.
+  affected_features.set_empty_key(GraphFeature(-1, -1, -1));
+  affected_features.set_deleted_key(GraphFeature(-2, -2, -2));
+
+  Uint64FactorFeaturesMap factor_affected_features;
+
+  for (size_t i = 0; i < a->assignments_.size(); ++i) {
+    if (a->assignments_[i].must_infer) {
+      std::vector<int> candidates;
+      a->GetLabelCandidates(*this, i, &candidates, beam_size_);
+
+      // Compute estimated normalisation constant
+      double normalization_constant = -a->GetNodePenalty(i);
+      candidates.push_back(a->assignments_[i].label);
+      for (const int label : candidates) {
+        normalization_constant += exp(a->GetNodeScoreGivenAssignmentToANode(*this, i, i, label));
+      }
+      for (int label : candidates) {
+        double marginal_probability = exp(a->GetNodeScoreGivenAssignmentToANode(*this, i, i, label)) / normalization_constant;
+        a->GetNeighboringAffectedFeatures(&affected_features, i, label, -learning_rate * marginal_probability);
+        a->GetFactorAffectedFeaturesOfNode(&factor_affected_features, i, label, -learning_rate * marginal_probability);
+      }
+    }
+  }
+
+  a->GetAffectedFeatures(&affected_features, beam_size_ * learning_rate);
+  a->GetAffectedFactorFeatures(&factor_affected_features, beam_size_ * learning_rate);
+  for (auto it = affected_features.begin(); it != affected_features.end(); ++it) {
+    if (it->second < -1e-9 || it->second > 1e-9) {
+      auto features_it = features_.find(it->first);
+      if (features_it != features_.end()) {
+        features_it->second.atomicAddRegularized(it->second, 0, regularizer_);
+      }
+    }
+  }
+
+  for (auto f_feature = factor_affected_features.begin(); f_feature != factor_affected_features.end(); ++f_feature) {
+    if (f_feature->second < -1e-9 || f_feature->second > 1e-9) {
+      auto factor_feature = factor_features_.find(f_feature->first);
+      if (factor_feature != factor_features_.end()) {
+        factor_feature->second += f_feature->second;
+        // L_inf regularize the new value.
+        if (factor_feature->second < 0) factor_feature->second = 0;
+        if (factor_feature->second > regularizer_) factor_feature->second = regularizer_;
       }
     }
   }
@@ -1154,6 +1621,7 @@ void GraphInference::AddQueryToModel(const Json::Value& query, const Json::Value
   CHECK(assignment.isArray());
   JsonValueNumberer numb;
   std::unordered_map<int, int> values;
+  std::set<int> unique_values;
   for (const Json::Value& a : assignment) {
     int value;
     if (a.isMember("inf")) {
@@ -1163,7 +1631,12 @@ void GraphInference::AddQueryToModel(const Json::Value& query, const Json::Value
       value = strings_.addString(a.get("giv", Json::Value::null).asCString());
     }
     values[numb.ValueToNumber(a.get("v", Json::Value::null))] = value;
+    unique_values.insert(value);
   }
+  for (int value : unique_values) {
+    ++label_frequency_[value];
+  }
+
   for (const Json::Value& arc : query) {
     if (arc.isMember("f2")) {
       GraphFeature feature(
@@ -1174,20 +1647,85 @@ void GraphInference::AddQueryToModel(const Json::Value& query, const Json::Value
         features_[feature].nonAtomicAdd(1);
       }
     }
+
+    if (FLAGS_use_factors) {
+      if (arc.isMember("group")) {
+        const Json::Value& v = arc["group"];
+        if (v.isArray()) {
+          Factor factor_vars;
+          uint64 hash = 0;
+          for (const Json::Value& item : v) {
+            int value = FindWithDefault(values, numb.ValueToNumber(item), -1);
+            if (value == -1) {
+              factor_vars.clear();
+              break;
+            }
+            factor_vars.insert(value);
+            hash += HashInt(value);
+          }
+          if (factor_vars.empty()) {
+            continue;
+          }
+          factors_set_.insert(factor_vars);
+          factor_features_[hash] += 1;
+        }
+      }
+    }
   }
 }
 
 void GraphInference::PrepareForInference() {
+  if (!FLAGS_unknown_label.empty()) {
+    unknown_label_ = strings_.addString(FLAGS_unknown_label.c_str());
+  }
   if (!label_checker_.IsLoaded()) {
     LOG(INFO) << "Loading LabelChecker...";
     label_checker_.Load(FLAGS_valid_labels, &strings_);
     LOG(INFO) << "LabelChecker loaded";
   }
+  if (unknown_label_ >= 0 && FLAGS_min_freq_known_label > 0) {
+    LOG(INFO) << "Replacing rare labels with unknown label " << FLAGS_unknown_label << " ...";
+    {
+      google::dense_hash_map<int, int> updated_freq;
+      updated_freq.set_empty_key(label_frequency_.empty_key());
+      updated_freq.set_deleted_key(label_frequency_.deleted_key());
+      for (auto it = label_frequency_.begin(); it != label_frequency_.end(); ++it) {
+        if (it->second >= FLAGS_min_freq_known_label) {
+          updated_freq[it->first] = it->second;
+        }
+      }
+      LOG(INFO) << "Removed " << (label_frequency_.size() - updated_freq.size())
+                  << " low frequency labels out of " << label_frequency_.size() << " labels.";
+      label_frequency_.swap(updated_freq);
+    }
+    {
+      FeaturesMap updated_map;
+      updated_map.set_empty_key(features_.empty_key());
+      updated_map.set_deleted_key(features_.deleted_key());
+      for (auto it = features_.begin(); it != features_.end(); ++it) {
+        GraphFeature f = it->first;
+        double feature_weight = it->second.getValue();
+        if (label_frequency_.find(f.a_) == label_frequency_.end()) {
+          f.a_ = unknown_label_;
+        }
+        if (label_frequency_.find(f.b_) == label_frequency_.end()) {
+          f.b_ = unknown_label_;
+        }
+        updated_map[f].nonAtomicAdd(feature_weight);
+      }
+      LOG(INFO) << "Removed " << (features_.size() - updated_map.size())
+                  << " out of " << features_.size() << " features.";
+      features_.swap(updated_map);
+    }
+  }
   num_svm_training_samples_ = 0;
+
 
   best_features_for_type_.clear();
   best_features_for_a_type_.clear();
   best_features_for_b_type_.clear();
+  best_factor_features_first_level_.clear();
+
   for (auto it = features_.begin(); it != features_.end(); ++it) {
     const GraphFeature& f = it->first;
     double feature_weight = it->second.getValue();
@@ -1195,6 +1733,18 @@ void GraphInference::PrepareForInference() {
     best_features_for_a_type_[IntPair(f.a_, f.type_)].push_back(std::pair<double, int>(feature_weight, f.b_));
     best_features_for_b_type_[IntPair(f.b_, f.type_)].push_back(std::pair<double, int>(feature_weight, f.a_));
   }
+  for (auto factor_feature = factors_set_.begin(); factor_feature != factors_set_.end(); ++factor_feature) {
+    Factor f = *factor_feature;
+    uint64 hash = 0;
+    for (auto current_var = f.begin(); current_var != f.end(); ++current_var) {
+      hash += HashInt(*current_var);
+    }
+    double feature_weight = factor_features_[hash];
+    Factor visited_labels;
+    std::shared_ptr<std::pair<double, Factor>> factor_feature_shared_pointer = std::make_shared<std::pair<double, Factor>>(feature_weight, f);
+    best_factor_features_first_level_[f.size()].InsertFactorFeature(factor_feature_shared_pointer, f, 0, FLAGS_maximum_depth, -1, visited_labels, kFactorsLimitBeforeGoingDepperMultiLevelMap);
+  }
+
   LOG(INFO) << "Preparing GraphInference for MAP inference...";
   for (auto it = best_features_for_type_.begin(); it != best_features_for_type_.end(); ++it) {
     std::sort(it->second.begin(), it->second.end(), std::greater<std::pair<double, GraphFeature> >());
@@ -1204,6 +1754,9 @@ void GraphInference::PrepareForInference() {
   }
   for (auto it = best_features_for_b_type_.begin(); it != best_features_for_b_type_.end(); ++it) {
     std::sort(it->second.begin(), it->second.end(), std::greater<std::pair<double, int> >());
+  }
+  for (auto it = best_factor_features_first_level_.begin(); it != best_factor_features_first_level_.end(); ++it) {
+    it->second.SortFactorFeatures();
   }
   LOG(INFO) << "GraphInference prepared for MAP inference.";
 }

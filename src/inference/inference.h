@@ -24,7 +24,6 @@
 
 // Abstract classes for inference.
 
-
 // A single query to be asked.
 class Nice2Query {
 public:
@@ -34,14 +33,18 @@ public:
 };
 
 struct PrecisionStats {
-  PrecisionStats() : correct_labels(0), incorrect_labels(0) {}
+  PrecisionStats() : correct_labels(0), incorrect_labels(0), num_known_predictions(0) {}
   void AddStats(const PrecisionStats& o) {
     correct_labels += o.correct_labels;
     incorrect_labels += o.incorrect_labels;
+    num_known_predictions += o.num_known_predictions;
   }
 
-  int correct_labels;
+  int correct_labels;  // When making an unknown prediction, this is considered an incorrect label.
   int incorrect_labels;
+
+  // Only includes labels that were predicted not be unknown.
+  int num_known_predictions;
 
   std::mutex lock;
 };
@@ -50,6 +53,7 @@ struct SingleLabelErrorStats {
   std::map<std::string, int> errors_and_counts;
   std::mutex lock;
 };
+
 
 // Assigned results for the query (including the pre-assigned values).
 class Nice2Assignment {
@@ -91,8 +95,14 @@ public:
   // Gets the score of a given assignment.
   virtual double GetAssignmentScore(const Nice2Assignment* assignment) const = 0;
 
+  // Method containing common initializations between the different learning algorithms
+  virtual void InitializeFeatureWeights(double regularization) = 0;
+
   // Initializes SSVM learning.
-  virtual void SSVMInit(double regularization, double margin) = 0;
+  virtual void SSVMInit(double margin) = 0;
+
+  // Initializes PL learning
+  virtual void PLInit(int beam_size) = 0;
 
   // Train on a single query + assignment of properties.
   // PrepareForInference and SSVMInit must have been called before SSVMLearn.
@@ -105,13 +115,19 @@ public:
       double learning_rate,
       PrecisionStats* stats) = 0;
 
+
+  // This method executes a training based on the optimization of the pseudolikelihood
+  virtual void PLLearn(
+      const Nice2Query* query,
+      const Nice2Assignment* assignment,
+      double learning_rate) = 0;
+
   // All queries that a SSVM should learn from must be given first with AddQueryToModel.
   // This is to ensure all the relevant features are added to the model.
   virtual void AddQueryToModel(const Json::Value& query, const Json::Value& assignment) = 0;
 
   // Must be called [at least] once before calling SSVMLearn or MapInference.
   virtual void PrepareForInference() = 0;
-
 
   // DEBUG methods.
   // Given a query and an assignment, return a graph to visualize the query.
